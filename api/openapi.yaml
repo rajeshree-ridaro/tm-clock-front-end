@@ -1,0 +1,1638 @@
+openapi: 3.1.0
+info:
+  title: TM Clock API
+  version: 1.0.0
+  summary: Time clock for crews of 50 or fewer — web portal, crew app (Flutter), and TM Clock superadmin.
+  description: |
+    One REST API serves three clients:
+      * **Crew app** (Flutter, iOS/Android, and later a tablet kiosk) — clock in/out with photo + GPS, breaks, safety briefings and signatures.
+      * **Web portal** (owners, office admins, supervisors) — approvals, timecards, schedules, employees, job sites, tasks, reports, history, settings, plan.
+      * **Superadmin portal** (TM Clock staff) — the `/admin/...` paths (full URL `/v1/admin/...`), separate login with MFA and a different token audience.
+
+    Read `docs/API.md` first: it has the business rules (overtime, grace periods, ads and punch timing, retention,
+    history logging, permissions) that the endpoints below must enforce.
+
+    **Conventions**
+      * All tenant endpoints get the company from the access token. Never accept `companyId` from the client.
+      * Times are ISO-8601 UTC (`2026-11-22T12:02:00Z`). `workDate`, `start`, `end` of a pay period are local dates `YYYY-MM-DD` in the company time zone.
+      * Money is in integer cents. Hours are in integer minutes.
+      * Lists use cursor paging: `?limit=50&cursor=...` → `{ items, nextCursor }`.
+      * Every write that changes customer data writes one `history` entry (see docs/API.md §History) in the same transaction.
+      * Send `Accept-Language: en|es`. Error messages and `what` texts come back in that language.
+      * Writes accept an `Idempotency-Key` header; the crew app always sends one.
+      * `x-permission` on an operation = the permission key that the caller's role must have (docs/API.md §Permissions).
+  contact: { name: Top Wire Techs LLC, email: roque@topwiretechs.com }
+servers:
+  - url: https://api.tmclock.app/v1
+    description: Production (tenant API)
+  - url: http://localhost:8080/v1
+    description: Local development
+security:
+  - bearer: []
+tags:
+  - { name: Auth }
+  - { name: Company & settings }
+  - { name: Users }
+  - { name: Job sites }
+  - { name: Tasks }
+  - { name: Safety lists }
+  - { name: Schedules }
+  - { name: Punches }
+  - { name: Approvals }
+  - { name: Timecards }
+  - { name: Safety briefings }
+  - { name: Reports & PDF }
+  - { name: History }
+  - { name: Files }
+  - { name: Plan & billing }
+  - { name: Ads }
+  - { name: Support access }
+  - { name: Utilities }
+  - { name: Superadmin }
+
+paths:
+  # ============================ AUTH ============================
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Portal sign-in (email + password, or Google)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [email, password]
+                  properties: { email: { type: string, format: email }, password: { type: string, minLength: 8 } }
+                - type: object
+                  required: [googleIdToken]
+                  properties: { googleIdToken: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '401': { $ref: '#/components/responses/Error' }
+        '423': { description: Account locked after too many attempts, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /auth/otp/send:
+    post:
+      tags: [Auth]
+      summary: Crew app — send a 6-digit code by SMS (or email)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [phone], properties: { phone: { type: string, example: '+14075550110' }, channel: { type: string, enum: [sms, email], default: sms } } } } }
+      responses:
+        '204': { description: Code sent (same response whether or not the phone exists) }
+        '429': { $ref: '#/components/responses/Error' }
+  /auth/otp/verify:
+    post:
+      tags: [Auth]
+      summary: Crew app — verify the code; returns tokens for this phone
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [phone, code, device], properties: { phone: { type: string }, code: { type: string, pattern: '^\d{6}$' }, device: { $ref: '#/components/schemas/Device' } } } } }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/pin:
+    post:
+      tags: [Auth]
+      summary: Shared phone or kiosk tablet — person picks their name and enters their PIN
+      description: The device must already hold a `kiosk` session (paired by an owner/admin/supervisor). Returns a short-lived token for one punch or one signature.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [userId, pin], properties: { userId: { $ref: '#/components/schemas/Id' }, pin: { type: string, pattern: '^\d{4,6}$' } } } } }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/kiosk/pair:
+    post:
+      tags: [Auth]
+      summary: Pair a shared phone or kiosk tablet to the company (a signed-in owner, admin or supervisor does this once)
+      x-permission: punch.crew
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [device, name], properties: { name: { type: string, example: Lake Nona trailer tablet }, siteId: { $ref: '#/components/schemas/Id' }, device: { $ref: '#/components/schemas/Device' } } } } } }
+      responses:
+        '200': { description: 'Kiosk session (kind=kiosk). The device then shows the crew list and uses /auth/pin.', content: { application/json: { schema: { type: object, properties: { kioskToken: { type: string }, crew: { type: array, items: { $ref: '#/components/schemas/UserRef' } } } } } } }
+  /auth/select-company:
+    post:
+      tags: [Auth]
+      summary: Pick (or switch to) one of my companies — returns tokens scoped to it
+      description: |
+        One login (account) can belong to many companies. After sign-in, if the account has more than one active
+        membership, the app shows the company picker and calls this. Switching later calls it again.
+        * The new token's `cid` and `uid` (membership) and `role` are that company's.
+        * Crew app: switching is refused with 409 `CLOCKED_IN_ELSEWHERE` while the person is clocked in or on break at the current company.
+        * `remember=true` stores it as `accounts.lastCompanyId` so the picker pre-selects it.
+        * Employee-only memberships can't open the web portal (403 `PORTAL_NOT_ALLOWED`); they use the crew app.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [companyId], properties: { companyId: { $ref: '#/components/schemas/Id' }, remember: { type: boolean }, client: { type: string, enum: [portal, app, kiosk] } } } } } }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '403': { description: 'Not a member of that company, or an employee trying to open the portal (PORTAL_NOT_ALLOWED)' }
+        '409': { description: 'Clocked in at the current company — clock out first (CLOCKED_IN_ELSEWHERE)' }
+  /me/companies:
+    get:
+      tags: [Auth]
+      summary: Companies this login belongs to, with my role in each (for the picker and the switcher)
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Membership' } }, currentCompanyId: { type: [string, 'null'] } } } } } } }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Exchange a refresh token (rotated on every use)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [refreshToken], properties: { refreshToken: { type: string } } } } } }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the current session
+      responses: { '204': { description: Signed out } }
+  /auth/invite/accept:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Accept an invite link (sets PIN for crew, password for portal users)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string }, pin: { type: string, pattern: '^\d{4,6}$' }, password: { type: string, minLength: 8 }, language: { type: string, enum: [en, es] } } } } } }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '410': { description: Invite expired }
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Send a password reset link (portal users)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email], properties: { email: { type: string, format: email } } } } } }
+      responses: { '204': { description: Sent if the email exists } }
+  /auth/signup:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Create a new company (free plan) and its owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [companyName, ownerName, email, password, state, timezone]
+              properties:
+                companyName: { type: string }
+                ownerName: { type: string }
+                email: { type: string, format: email }
+                phone: { type: string }
+                password: { type: string, minLength: 8 }
+                state: { type: string, minLength: 2, maxLength: 2 }
+                timezone: { type: string, example: America/New_York }
+                language: { type: string, enum: [en, es] }
+                promoCode: { type: string, description: e.g. FOUNDING }
+      responses:
+        '201': { $ref: '#/components/responses/Tokens' }
+        '409': { description: Email already used }
+  /me:
+    get:
+      tags: [Auth]
+      summary: Who am I — user, company summary, effective permissions, plan limits
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  company: { $ref: '#/components/schemas/CompanySummary' }
+                  permissions: { type: array, items: { $ref: '#/components/schemas/PermissionKey' } }
+                  supportSession: { $ref: '#/components/schemas/SupportAccess' }
+    patch:
+      tags: [Auth]
+      summary: Update my own language, PIN or password
+      requestBody: { content: { application/json: { schema: { type: object, properties: { language: { type: string, enum: [en, es] }, pin: { type: string }, currentPassword: { type: string }, newPassword: { type: string } } } } } }
+      responses: { '200': { description: OK } }
+  /me/status:
+    get:
+      tags: [Punches]
+      summary: Crew app home — am I clocked in, on break, today's shift, open briefing to sign
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [out, in, onBreak] }
+                  lastPunch: { $ref: '#/components/schemas/Punch' }
+                  todayMinutes: { type: integer }
+                  weekMinutes: { type: integer }
+                  shift: { $ref: '#/components/schemas/Shift' }
+                  breakLengthMin: { type: integer }
+                  briefingToSign: { $ref: '#/components/schemas/Briefing' }
+                  ads: { $ref: '#/components/schemas/AdConfig' }
+  /me/shifts:
+    get:
+      tags: [Schedules]
+      summary: My published shifts
+      parameters: [ { $ref: '#/components/parameters/from' }, { $ref: '#/components/parameters/to' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Shift' } } } } } } } }
+  /me/timecard:
+    get:
+      tags: [Timecards]
+      summary: My timecard for a pay period (crew app "My hours")
+      parameters: [ { name: payPeriodId, in: query, schema: { $ref: '#/components/schemas/Id' } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Timecard' } } } } }
+
+  # ============================ COMPANY ============================
+  /company:
+    get:
+      tags: [Company & settings]
+      summary: Company profile and all settings
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Company' } } } } }
+    patch:
+      tags: [Company & settings]
+      summary: Update company profile (name, address, phone, state, time zone, week start, language)
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CompanyProfilePatch' } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Company' } } } } }
+  /company/settings:
+    patch:
+      tags: [Company & settings]
+      summary: Update any settings section (partial). Logs one history entry per changed field.
+      description: |
+        Sections: `payPeriod`, `overtime`, `rounding`, `location`, `breaks`, `grace`, `permissions`.
+        Changing `payPeriod.type` only takes effect from the next period start.
+        `permissions` changes are owner-only even when admin has company.settings.
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CompanySettings' } } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Company' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+  /company/logo:
+    put:
+      tags: [Company & settings]
+      summary: Set the logo (file uploaded first with /files/upload-url)
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileId], properties: { fileId: { $ref: '#/components/schemas/Id' } } } } } }
+      responses: { '204': { description: OK } }
+  /company/resign-code:
+    put:
+      tags: [Company & settings]
+      summary: Set the supervisor code used to let someone sign a briefing again
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code], properties: { code: { type: string, pattern: '^\d{4,8}$' } } } } } }
+      responses: { '204': { description: Saved (stored hashed) } }
+  /company/messaging:
+    get:
+      tags: [Company & settings]
+      summary: Text message (SMS) settings — the token is never returned, only its last 4
+      x-permission: company.settings
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Messaging' } } } } }
+    put:
+      tags: [Company & settings]
+      summary: Use TM Clock texting, or connect the company's own provider (owner only)
+      description: |
+        * `token` is write-only. Send it only when setting or replacing it; omit it to keep the saved one.
+        * The server checks the credentials with the provider (e.g. Twilio: fetch the account and the from number) before saving; 422 `PROVIDER_REJECTED` if they fail.
+        * Stored envelope-encrypted (KMS). Never logged, never returned, never shown to TM Clock staff.
+        * History logs the change with the token as `•••• last4`.
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessagingInput' } } } }
+      responses:
+        '200': { description: Saved, content: { application/json: { schema: { $ref: '#/components/schemas/Messaging' } } } }
+        '422': { description: 'Missing field, bad number, or the provider rejected the credentials (PROVIDER_REJECTED)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [Company & settings]
+      summary: Disconnect the company's provider and go back to TM Clock texting (deletes the stored token)
+      x-permission: company.settings
+      responses: { '204': { description: Disconnected } }
+  /company/messaging/test:
+    post:
+      tags: [Company & settings]
+      summary: Send a test text through the saved provider
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [to], properties: { to: { type: string, example: '+14075550110' } } } } } }
+      responses:
+        '200': { description: Sent, content: { application/json: { schema: { type: object, properties: { status: { type: string }, providerMessageId: { type: string } } } } } }
+        '422': { description: 'Provider error, passed through (for example an unregistered 10DLC number)' }
+  /webhooks/sms/{companyId}/{provider}:
+    post:
+      tags: [Company & settings]
+      security: []
+      summary: "Delivery receipts and STOP/HELP replies from the company's own provider. Verify the provider's signature."
+      parameters: [ { name: companyId, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }, { name: provider, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: OK } }
+  /company/overtime-rules:
+    get:
+      tags: [Company & settings]
+      summary: Overtime rule catalog (federal, CA, AK, NV, CO, MN, PR, custom) with bilingual notes
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/OvertimeRule' } } } } } }
+  /company/data:
+    get:
+      tags: [Company & settings]
+      summary: Data limit status — retention days, oldest date kept, next purge, legal hold
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  retentionDays: { type: integer, example: 90 }
+                  keptSince: { type: string, format: date }
+                  nextPurgeAt: { type: string, format: date-time }
+                  legalHold: { type: boolean }
+                  acknowledgedAt: { type: [string, 'null'], format: date-time }
+  /company/data/acknowledge:
+    post:
+      tags: [Company & settings]
+      summary: Owner/admin confirms they understand the data limit and their legal duty to keep exports
+      x-permission: company.settings
+      responses: { '204': { description: OK } }
+
+  # ============================ USERS ============================
+  /users:
+    get:
+      tags: [Users]
+      summary: List people (filters match the Employees page)
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: role, in: query, schema: { $ref: '#/components/schemas/Role' } }
+        - { name: status, in: query, schema: { type: string, enum: [invited, active, inactive] } }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/cursor' }
+      responses: { '200': { description: 'OK. payRateCents is omitted unless the caller has pay.view.', content: { application/json: { schema: { $ref: '#/components/schemas/UserPage' } } } } }
+    post:
+      tags: [Users]
+      summary: Invite an employee (sends SMS/email). Fails with 402 when the plan's seats are full.
+      description: |
+        If the phone or email already belongs to a TM Clock login (they work for another company too), the new
+        membership is linked to that same account: they keep their login, PIN and language and pick this company in the app.
+        The response says `existingAccount: true` but never reveals which other companies they work for.
+      x-permission: users.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserInput' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { allOf: [ { $ref: '#/components/schemas/User' }, { type: object, properties: { existingAccount: { type: boolean } } } ] } } } }
+        '409': { description: This person is already a member of this company }
+        '402': { description: Seat limit reached — response includes the upgrade/extra seats quote, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /users/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    get:
+      tags: [Users]
+      summary: One person
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } } }
+    patch:
+      tags: [Users]
+      summary: Update a person (role, supervisor, phone, language, anywhere, pay rate, emergency contact, status)
+      description: Setting `payRateCents` requires pay.view. Changing `role` to owner is not allowed (use ownership transfer). Deactivating keeps all records.
+      x-permission: users.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserInput' } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } } }
+  /users/{id}/resend-invite:
+    post:
+      tags: [Users]
+      x-permission: users.manage
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      responses: { '204': { description: Sent } }
+  /users/{id}/reference-photo:
+    put:
+      tags: [Users]
+      summary: Set the photo on file that punch photos are compared to
+      x-permission: users.manage
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileId], properties: { fileId: { $ref: '#/components/schemas/Id' } } } } } }
+      responses: { '204': { description: OK } }
+  /users/{id}/summary:
+    get:
+      tags: [Users]
+      summary: Employee detail page — stats, punches, job sites, earnings, safety briefings for a pay period
+      parameters: [ { $ref: '#/components/parameters/id' }, { name: payPeriodId, in: query, schema: { $ref: '#/components/schemas/Id' } } ]
+      responses:
+        '200':
+          description: OK. `earnings` is null unless the caller has pay.view. Supervisors only see their own crew.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  timecard: { $ref: '#/components/schemas/Timecard' }
+                  sites: { type: array, items: { type: object, properties: { siteId: { $ref: '#/components/schemas/Id' }, name: { type: string }, minutes: { type: integer }, days: { type: integer } } } }
+                  earnings: { $ref: '#/components/schemas/Earnings' }
+                  briefings: { type: array, items: { $ref: '#/components/schemas/BriefingForUser' } }
+  /users/transfer-ownership:
+    post:
+      tags: [Users]
+      summary: Owner hands ownership to another active user (current owner becomes admin)
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [userId, password], properties: { userId: { $ref: '#/components/schemas/Id' }, password: { type: string } } } } } }
+      responses: { '204': { description: Done } }
+
+  # ============================ JOB SITES ============================
+  /sites:
+    get:
+      tags: [Job sites]
+      parameters: [ { name: active, in: query, schema: { type: boolean } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Site' } } } } } } } }
+    post:
+      tags: [Job sites]
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Site' } } } } }
+  /sites/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    get: { tags: [Job sites], responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Site' } } } } } }
+    patch:
+      tags: [Job sites]
+      summary: Update (turn off with active=false; sites with punches are never deleted)
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteInput' } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Site' } } } } }
+  /sites/{id}/test-point:
+    post:
+      tags: [Job sites]
+      summary: Is this point inside the boundary? (the "test a point" tool on the map)
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [lat, lng], properties: { lat: { type: number }, lng: { type: number } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { distanceFt: { type: integer }, inside: { type: boolean } } } } } } }
+  /geocode:
+    get:
+      tags: [Job sites]
+      summary: Address search (proxied to Mapbox so the key stays on the server)
+      parameters: [ { name: q, in: query, required: true, schema: { type: string, minLength: 3 } }, { name: near, in: query, schema: { type: string, example: '28.54,-81.38' } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { label: { type: string }, lat: { type: number }, lng: { type: number }, state: { type: string }, placeId: { type: string } } } } } } } }
+
+  # ============================ TASKS ============================
+  /tasks:
+    get:
+      tags: [Tasks]
+      parameters: [ { name: includeOff, in: query, schema: { type: boolean } }, { name: siteId, in: query, schema: { $ref: '#/components/schemas/Id' } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Task' } } } } } } } }
+    post:
+      tags: [Tasks]
+      summary: Add a task. If only one language is typed, the other is auto-translated (src marks the original).
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TaskInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } }, '409': { description: Code already used } }
+  /tasks/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    patch:
+      tags: [Tasks]
+      summary: Edit or turn off (tasks with time on them can't be deleted)
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TaskInput' } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } } }
+  /tasks/reorder:
+    post:
+      tags: [Tasks]
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [ids], properties: { ids: { type: array, items: { $ref: '#/components/schemas/Id' } } } } } } }
+      responses: { '204': { description: OK } }
+
+  # ============================ SAFETY LISTS ============================
+  /safety-items:
+    get:
+      tags: [Safety lists]
+      parameters: [ { name: kind, in: query, schema: { type: string, enum: [hazard, ppe] } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/SafetyItem' } } } } } } } }
+    post:
+      tags: [Safety lists]
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SafetyItemInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/SafetyItem' } } } } }
+  /safety-items/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    patch:
+      tags: [Safety lists]
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SafetyItemInput' } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/SafetyItem' } } } } }
+  /safety-items/reorder:
+    post:
+      tags: [Safety lists]
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [kind, ids], properties: { kind: { type: string, enum: [hazard, ppe] }, ids: { type: array, items: { $ref: '#/components/schemas/Id' } } } } } } }
+      responses: { '204': { description: OK } }
+
+  # ============================ SCHEDULES ============================
+  /shifts:
+    get:
+      tags: [Schedules]
+      summary: Week grid. Filters match the Schedules page (week, job site, person search).
+      parameters:
+        - { name: weekStart, in: query, required: true, schema: { type: string, format: date } }
+        - { name: siteId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+        - { name: q, in: query, schema: { type: string } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Shift' } }, totals: { type: object, properties: { people: { type: integer }, shifts: { type: integer }, minutes: { type: integer } } } } } } } } }
+    post:
+      tags: [Schedules]
+      summary: Add a shift (optionally repeat for the rest of the week)
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { allOf: [ { $ref: '#/components/schemas/ShiftInput' }, { type: object, properties: { repeatRestOfWeek: { type: boolean } } } ] } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Shift' } } } } } }
+  /shifts/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    patch:
+      tags: [Schedules]
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShiftInput' } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Shift' } } } } }
+    delete:
+      tags: [Schedules]
+      x-permission: sites.manage
+      responses: { '204': { description: Removed } }
+  /shifts/copy-week:
+    post:
+      tags: [Schedules]
+      summary: Copy last week into this week (skips days that already have a shift)
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fromWeekStart, toWeekStart], properties: { fromWeekStart: { type: string, format: date }, toWeekStart: { type: string, format: date }, siteId: { $ref: '#/components/schemas/Id' } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { copied: { type: integer }, skipped: { type: integer } } } } } } }
+  /shifts/publish:
+    post:
+      tags: [Schedules]
+      summary: Publish a week — each person gets their shifts by SMS and push, in their language
+      x-permission: sites.manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [weekStart], properties: { weekStart: { type: string, format: date }, siteId: { $ref: '#/components/schemas/Id' } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { notified: { type: integer } } } } } } }
+
+  # ============================ PUNCHES ============================
+  /punches:
+    get:
+      tags: [Punches]
+      summary: Search punches (portal). Supervisors see their crew only.
+      parameters:
+        - { $ref: '#/components/parameters/from' }
+        - { $ref: '#/components/parameters/to' }
+        - { name: userId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+        - { name: siteId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+        - { name: reviewStatus, in: query, schema: { type: string, enum: [pending, approved, rejected, retake] } }
+        - { name: flag, in: query, schema: { $ref: '#/components/schemas/PunchFlag' } }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/cursor' }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Punch' } }, nextCursor: { type: [string, 'null'] } } } } } } }
+    post:
+      tags: [Punches]
+      summary: Clock in, start/end break, clock out — for yourself, or a supervisor for a crew member
+      description: |
+        * Server validates GPS against the job site boundary and applies `settings.location.outsideRule` (block → 422, flag → saved with `outside` flag, allow).
+        * Supervisor punching for someone else sets `source=supervisor` and `byUserId`.
+        * Grace periods are applied when building the timecard, not by changing `at` (see docs/API.md §Grace).
+        * **Free plan clock-out**: the app sends `at` = the moment the ad ended (or `deviceAt` of the tap if no ad filled). Clock-in uses the tap time. See docs/API.md §Ads.
+        * `clientId` makes retries safe: the same clientId returns the original punch with 200.
+      x-permission: punch.self
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PunchCreate' } } } }
+      responses:
+        '201': { description: Saved, content: { application/json: { schema: { $ref: '#/components/schemas/Punch' } } } }
+        '200': { description: Duplicate clientId — returns the punch already saved, content: { application/json: { schema: { $ref: '#/components/schemas/Punch' } } } }
+        '409': { description: 'Wrong state, e.g. clock out while not clocked in, or CLOCKED_IN_ELSEWHERE — the same person is still clocked in at another company', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: 'Blocked: outside the job site (code OUTSIDE_SITE) or outside grace with gBlock (code OUTSIDE_GRACE). Response carries distanceFt so the app can offer the supervisor-code override.', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /punches/batch:
+    post:
+      tags: [Punches]
+      summary: Offline sync — upload punches saved on the phone while there was no signal (max 200)
+      x-permission: punch.self
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [items], properties: { items: { type: array, maxItems: 200, items: { $ref: '#/components/schemas/PunchCreate' } } } } } } }
+      responses: { '207': { description: Per-item result, content: { application/json: { schema: { type: array, items: { type: object, properties: { clientId: { type: string }, status: { type: integer }, punch: { $ref: '#/components/schemas/Punch' }, error: { $ref: '#/components/schemas/Error' } } } } } } } }
+  /punches/check-location:
+    post:
+      tags: [Punches]
+      summary: Before the camera opens — nearest job site, distance, inside/outside, and whether an override is needed
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [lat, lng], properties: { lat: { type: number }, lng: { type: number }, accuracyFt: { type: integer } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { site: { $ref: '#/components/schemas/Site' }, distanceFt: { type: integer }, inside: { type: boolean }, rule: { type: string, enum: [block, flag, allow] }, overrideAllowed: { type: array, items: { type: string, enum: [supervisorCode, anywhere, day] } } } } } } } }
+  /punches/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    get:
+      tags: [Punches]
+      summary: One punch with photo URLs, reference photo, GPS and edit trail
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/PunchDetail' } } } } }
+    patch:
+      tags: [Punches]
+      summary: Edit a punch (type, time, job site, task). Reason is required. Locked periods need payperiod.editLocked.
+      x-permission: punch.edit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PunchEdit' } } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Punch' } } } }
+        '423': { description: Pay period is locked }
+  /punches/bulk-edit:
+    post:
+      tags: [Punches]
+      summary: Edit several punches at once (e.g. whole crew forgot to clock out at 3:30)
+      x-permission: punch.edit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, change, reason]
+              properties:
+                ids: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/Id' } }
+                change: { type: object, properties: { localTime: { type: string, pattern: '^\d{2}:\d{2}$' }, siteId: { $ref: '#/components/schemas/Id' }, taskId: { $ref: '#/components/schemas/Id' }, kind: { $ref: '#/components/schemas/PunchKind' } } }
+                reason: { $ref: '#/components/schemas/EditReason' }
+                note: { type: string, maxLength: 500 }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { updated: { type: integer } } } } } } }
+
+  # ============================ APPROVALS ============================
+  /approvals:
+    get:
+      tags: [Approvals]
+      summary: Photo approvals queue (pending first, then today's decided)
+      x-permission: punch.approve
+      parameters: [ { name: siteId, in: query, schema: { $ref: '#/components/schemas/Id' } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/PunchDetail' } }, pending: { type: integer }, pendingInside: { type: integer } } } } } } }
+  /punches/{id}/review:
+    post:
+      tags: [Approvals]
+      summary: Approve, reject, or ask for a retake
+      x-permission: punch.approve
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [decision], properties: { decision: { type: string, enum: [approved, rejected, retake] }, note: { type: string, maxLength: 500 } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Punch' } } } } }
+  /approvals/approve-on-site:
+    post:
+      tags: [Approvals]
+      summary: '"Approve all on site" — approves every pending punch that is inside its job site'
+      x-permission: punch.approve
+      requestBody: { content: { application/json: { schema: { type: object, properties: { siteId: { $ref: '#/components/schemas/Id' } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { approved: { type: integer } } } } } } }
+
+  # ============================ TIMECARDS ============================
+  /pay-periods:
+    get:
+      tags: [Timecards]
+      summary: Pay periods for the picker, with state (open, approved, locked, partlyDeleted, deleted by the data limit)
+      parameters: [ { $ref: '#/components/parameters/limit' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/PayPeriod' } } } } } } } }
+  /pay-periods/{id}/timecards:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    get:
+      tags: [Timecards]
+      summary: Timecards page — one row per person with daily hours, totals, overtime, status, plus period totals
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  period: { $ref: '#/components/schemas/PayPeriod' }
+                  rule: { $ref: '#/components/schemas/OvertimeRule' }
+                  items: { type: array, items: { $ref: '#/components/schemas/Timecard' } }
+                  totals: { type: object, properties: { regularMin: { type: integer }, otMin: { type: integer }, dtMin: { type: integer }, flagged: { type: integer }, approved: { type: integer }, people: { type: integer } } }
+    post:
+      tags: [Timecards]
+      summary: Add timecard — enter a day by hand (creates in/out punches with source=portal and the reason)
+      x-permission: punch.edit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManualTimecardInput' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Timecard' } } } }
+        '409': { description: 'The person already has punches that day (code DAY_HAS_PUNCHES); resend with replace=true to edit instead' }
+        '423': { description: Pay period is locked }
+  /pay-periods/{id}/timecards/{userId}/days/{date}:
+    get:
+      tags: [Timecards]
+      summary: One day for one person — punches with photos and GPS (for the map popup)
+      parameters: [ { $ref: '#/components/parameters/id' }, { name: userId, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }, { name: date, in: path, required: true, schema: { type: string, format: date } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { punches: { type: array, items: { $ref: '#/components/schemas/PunchDetail' } }, site: { $ref: '#/components/schemas/Site' }, minutes: { type: integer } } } } } } }
+  /pay-periods/{id}/approve:
+    post:
+      tags: [Timecards]
+      summary: Approve the pay period. Fails if any timecard still needs a fix unless force=true (owner/admin).
+      x-permission: timecards.approve
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { userIds: { type: array, items: { $ref: '#/components/schemas/Id' }, description: Approve only these people }, force: { type: boolean } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/PayPeriod' } } } }, '409': { description: Timecards still need a fix } }
+  /pay-periods/{id}/reopen:
+    post:
+      tags: [Timecards]
+      summary: Reopen an approved or locked period (reason required, logged)
+      x-permission: payperiod.editLocked
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 3 } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/PayPeriod' } } } } }
+  /pay-periods/{id}/export:
+    post:
+      tags: [Timecards]
+      summary: Payroll export — CSV, or send to TM Ledger. Includes the edit trail.
+      x-permission: payroll.export
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [format], properties: { format: { type: string, enum: [csv, ledger] } } } } } }
+      responses: { '202': { $ref: '#/components/responses/Job' } }
+  /timecards/{id}/sign:
+    post:
+      tags: [Timecards]
+      summary: Employee certifies their hours (crew app), or supervisor signs
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [as, signatureFileId], properties: { as: { type: string, enum: [employee, supervisor] }, signatureFileId: { $ref: '#/components/schemas/Id' } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Timecard' } } } } }
+
+  # ============================ SAFETY BRIEFINGS ============================
+  /briefings:
+    get:
+      tags: [Safety briefings]
+      summary: List briefings (Reports → Safety briefings, employee detail)
+      parameters:
+        - { name: payPeriodId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+        - { $ref: '#/components/parameters/from' }
+        - { $ref: '#/components/parameters/to' }
+        - { name: siteId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+        - { name: userId, in: query, description: Briefings this person gave or attended, schema: { $ref: '#/components/schemas/Id' } }
+        - { name: missingOnly, in: query, schema: { type: boolean } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Briefing' } } } } } } } }
+    post:
+      tags: [Safety briefings]
+      summary: Supervisor starts a briefing (PTSA) at a job site. Attendees default to everyone clocked in there.
+      x-permission: briefing.give
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BriefingCreate' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Briefing' } } } } }
+  /briefings/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    get:
+      tags: [Safety briefings]
+      summary: Full record with signature image URLs
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Briefing' } } } } }
+  /briefings/{id}/sign:
+    post:
+      tags: [Safety briefings]
+      summary: A person signs — on the supervisor's phone (after PIN) or in their own app. The giver signs with as=giver.
+      x-permission: punch.self
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [signatureFileId, device], properties: { userId: { $ref: '#/components/schemas/Id' }, as: { type: string, enum: [attendee, giver], default: attendee }, signatureFileId: { $ref: '#/components/schemas/Id' }, device: { type: string, enum: [supervisorPhone, ownPhone, kiosk] }, shownIn: { type: string, enum: [en, es] } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Briefing' } } } }, '409': { description: Already signed — use resign } }
+  /briefings/{id}/attendees/{userId}/resign:
+    post:
+      tags: [Safety briefings]
+      summary: Swipe-left "sign again" — supervisor enters the company resign code; the old signature is kept in resigns[]
+      x-permission: briefing.give
+      parameters: [ { $ref: '#/components/parameters/id' }, { name: userId, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code, reason], properties: { code: { type: string }, reason: { type: string, maxLength: 200 } } } } } }
+      responses: { '204': { description: The person can sign again }, '403': { description: Wrong code } }
+  /briefings/{id}/attendees:
+    post:
+      tags: [Safety briefings]
+      summary: Add someone who arrived late, or mark someone excused
+      x-permission: briefing.give
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [userId], properties: { userId: { $ref: '#/components/schemas/Id' }, status: { type: string, enum: [missing, excused] }, note: { type: string } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Briefing' } } } } }
+  /briefings/{id}/close:
+    post:
+      tags: [Safety briefings]
+      summary: Close the briefing — unsigned attendees become "missing" and the PDF record is generated
+      x-permission: briefing.give
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Briefing' } } } } }
+
+  # ============================ REPORTS & PDF ============================
+  /reports/{key}:
+    get:
+      tags: [Reports & PDF]
+      summary: Report data for the Reports page and its PDF
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string, enum: [site, task, ot, late, miss, out, edits, safety] } }
+        - { name: payPeriodId, in: query, required: true, schema: { $ref: '#/components/schemas/Id' } }
+        - { name: siteId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Report' } } } } }
+  /pdf:
+    post:
+      tags: [Reports & PDF]
+      summary: Make an official PDF on the server (same layouts as the portal's Save as PDF)
+      description: |
+        The portal can already build PDFs in the browser. Use this endpoint for records that must be identical everywhere
+        and stored with the data: briefing records (on close), approved timecards (on approve), payroll packets, and anything
+        emailed. Rendered with headless Chrome from the same HTML templates. Returns a job; poll /jobs/{id}.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [page, briefings, timecards, employee, report] }
+                page: { type: string, enum: [dashboard, approvals, timecards, tasks, employees, schedules, sites, reports, history, settings] }
+                reportKey: { type: string }
+                payPeriodId: { $ref: '#/components/schemas/Id' }
+                ids: { type: array, items: { $ref: '#/components/schemas/Id' }, description: Briefing ids or user ids }
+                filters: { type: object, additionalProperties: true, description: Same filters the page had (q, role, siteId, weekStart, module...) }
+                language: { type: string, enum: [en, es] }
+      responses: { '202': { $ref: '#/components/responses/Job' } }
+  /jobs/{id}:
+    get:
+      tags: [Reports & PDF]
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Job' } } } } }
+
+  # ============================ HISTORY ============================
+  /history:
+    get:
+      tags: [History]
+      summary: Change history (all modules or one). Read-only — there is no update or delete.
+      parameters:
+        - { name: module, in: query, schema: { $ref: '#/components/schemas/Module' } }
+        - { name: source, in: query, schema: { type: string, enum: [portal, app, kiosk, superadmin, system] } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: targetType, in: query, schema: { type: string } }
+        - { name: targetId, in: query, schema: { $ref: '#/components/schemas/Id' } }
+        - { $ref: '#/components/parameters/from' }
+        - { $ref: '#/components/parameters/to' }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/cursor' }
+      responses: { '200': { description: 'OK. Pay-rate before/after values come back as "🔒" without pay.view.', content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/HistoryEntry' } }, nextCursor: { type: [string, 'null'] }, counts: { type: object, additionalProperties: { type: integer } } } } } } } }
+  /history/export:
+    get:
+      tags: [History]
+      summary: CSV export with the same filters (UTF-8 with BOM, one row per changed field)
+      parameters: [ { name: module, in: query, schema: { $ref: '#/components/schemas/Module' } }, { $ref: '#/components/parameters/from' }, { $ref: '#/components/parameters/to' } ]
+      responses: { '200': { description: CSV, content: { text/csv: { schema: { type: string } } } } }
+
+  # ============================ FILES ============================
+  /files/upload-url:
+    post:
+      tags: [Files]
+      summary: Get a signed upload URL (photos, signatures, logos). Upload the bytes directly to storage, then call complete.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [kind, contentType, bytes], properties: { kind: { type: string, enum: [punchPhoto, refPhoto, signature, logo] }, contentType: { type: string, enum: [image/jpeg, image/png, image/webp, image/svg+xml] }, bytes: { type: integer, maximum: 5242880 }, sha256: { type: string } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { fileId: { $ref: '#/components/schemas/Id' }, url: { type: string }, method: { type: string, example: PUT }, headers: { type: object, additionalProperties: { type: string } }, expiresAt: { type: string, format: date-time } } } } } } }
+  /files/{id}/complete:
+    post:
+      tags: [Files]
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      responses: { '204': { description: Stored } }
+  /files/{id}/url:
+    get:
+      tags: [Files]
+      summary: Short-lived signed download URL (5 minutes). Access is checked against what the file belongs to.
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { url: { type: string }, expiresAt: { type: string, format: date-time } } } } } } }
+
+  # ============================ PLAN & BILLING ============================
+  /billing/plans:
+    get:
+      tags: [Plan & billing]
+      security: []
+      summary: Public price list (Free / Pro / Business) and active promotions
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { plans: { type: array, items: { $ref: '#/components/schemas/Plan' } }, promotions: { type: array, items: { $ref: '#/components/schemas/Promotion' } } } } } } } }
+  /billing:
+    get:
+      tags: [Plan & billing]
+      summary: Current plan, seats used, renewal, invoices
+      x-permission: company.settings
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Billing' } } } } }
+  /billing/quote:
+    post:
+      tags: [Plan & billing]
+      summary: Price calculator — cost for a plan, billing cycle and number of employees
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [tier, billing, employees], properties: { tier: { type: string, enum: [pro, business] }, billing: { type: string, enum: [yearly, monthly] }, employees: { type: integer, minimum: 1 }, promoCode: { type: string } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Quote' } } } } }
+  /billing/checkout:
+    post:
+      tags: [Plan & billing]
+      summary: Start Stripe Checkout to upgrade (returns the Stripe URL)
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [tier, billing], properties: { tier: { type: string, enum: [pro, business] }, billing: { type: string, enum: [yearly, monthly] }, extraSeats: { type: integer, multipleOf: 10, minimum: 0 }, promoCode: { type: string } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { url: { type: string } } } } } } }
+  /billing/seats:
+    post:
+      tags: [Plan & billing]
+      summary: Buy extra seats (blocks of 10, prorated to the renewal date)
+      x-permission: company.settings
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [add], properties: { add: { type: integer, multipleOf: 10, minimum: 10 } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Billing' } } } } }
+  /billing/portal:
+    post:
+      tags: [Plan & billing]
+      summary: Stripe customer portal link (cards, invoices, cancel)
+      x-permission: company.settings
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { url: { type: string } } } } } } }
+  /webhooks/stripe:
+    post:
+      tags: [Plan & billing]
+      security: []
+      summary: Stripe webhook (checkout.session.completed, invoice.paid, invoice.payment_failed, customer.subscription.updated/deleted). Verify the signature.
+      responses: { '200': { description: OK } }
+
+  # ============================ ADS ============================
+  /ads/config:
+    get:
+      tags: [Ads]
+      summary: What ads to show (free plan only) — networks in mediation order, placements, auto-close seconds, banner text
+      parameters: [ { name: surface, in: query, required: true, schema: { type: string, enum: [crewApp, portal] } }, { name: platform, in: query, schema: { type: string, enum: [ios, android, web] } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AdConfig' } } } } }
+  /ads/events:
+    post:
+      tags: [Ads]
+      summary: Log an ad request/start (returns adEventId to attach to the punch)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdEventInput' } } } }
+      responses: { '201': { description: OK, content: { application/json: { schema: { type: object, properties: { id: { $ref: '#/components/schemas/Id' } } } } } } }
+  /ads/events/{id}:
+    patch:
+      tags: [Ads]
+      summary: Log the end of an ad (endedAt, closedBy, revenue from the SDK's paid event)
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdEventInput' } } } }
+      responses: { '204': { description: OK } }
+
+  # ============================ SUPPORT ACCESS (customer side) ============================
+  /support-access:
+    get:
+      tags: [Support access]
+      summary: Requests from TM Clock staff to look at this company's data
+      x-permission: company.settings
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SupportAccess' } } } } } }
+  /support-access/{id}/decide:
+    post:
+      tags: [Support access]
+      summary: Owner approves (with a time limit) or denies; owner can also revoke at any time
+      x-permission: company.settings
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [decision], properties: { decision: { type: string, enum: [approve, deny, revoke] }, hours: { type: integer, minimum: 1, maximum: 72, default: 24 } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/SupportAccess' } } } } }
+
+  # ============================ UTILITIES ============================
+  /translate:
+    post:
+      tags: [Utilities]
+      summary: EN↔ES translation (cached). Used for notes, task names and safety list items.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [text, to], properties: { text: { type: string, maxLength: 4000 }, from: { type: string, enum: [en, es] }, to: { type: string, enum: [en, es] } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { text: { type: string }, from: { type: string } } } } } } }
+  /dashboard:
+    get:
+      tags: [Utilities]
+      summary: Dashboard — today's counts, who's on the clock, items needing attention, who starts soon
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  counts: { type: object, properties: { onClock: { type: integer }, scheduled: { type: integer }, onBreak: { type: integer }, late: { type: integer }, toReview: { type: integer } } }
+                  onClock: { type: array, items: { type: object, properties: { user: { $ref: '#/components/schemas/UserRef' }, site: { $ref: '#/components/schemas/SiteRef' }, since: { type: string, format: date-time }, todayMinutes: { type: integer }, state: { type: string, enum: [working, late, onBreak, offSite] }, photo: { type: string, enum: [pending, approved, rejected, retake] } } } }
+                  attention: { type: array, items: { type: object, properties: { kind: { type: string, enum: [outside, missingOut, nearOvertime, unsignedBriefing, longBreak] }, user: { $ref: '#/components/schemas/UserRef' }, detail: { type: string } } } }
+                  startingSoon: { type: array, items: { $ref: '#/components/schemas/Shift' } }
+  /health:
+    get:
+      tags: [Utilities]
+      security: []
+      responses: { '200': { description: OK } }
+
+  # ============================ SUPERADMIN (/admin/v1) ============================
+  /admin/auth/login:
+    post:
+      tags: [Superadmin]
+      security: []
+      summary: Staff sign-in — password + TOTP code (MFA required)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, password, totp], properties: { email: { type: string }, password: { type: string }, totp: { type: string, pattern: '^\d{6}$' } } } } } }
+      responses: { '200': { $ref: '#/components/responses/Tokens' } }
+  /admin/overview:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Companies by plan, MRR/ARR, ad revenue, active users, punches, costs, margin
+      parameters: [ { $ref: '#/components/parameters/from' }, { $ref: '#/components/parameters/to' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+  /admin/companies:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      parameters: [ { name: q, in: query, schema: { type: string } }, { name: tier, in: query, schema: { type: string, enum: [free, pro, business] } }, { name: status, in: query, schema: { type: string } }, { $ref: '#/components/parameters/limit' }, { $ref: '#/components/parameters/cursor' } ]
+      summary: Company list with plan, users, last activity, ad revenue, cost — no customer records
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AdminCompany' } }, nextCursor: { type: [string, 'null'] } } } } } } }
+    post:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Add company (sales-assisted signup) — sends the owner an invite
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [companyName, ownerName, ownerEmail, state, timezone, tier], properties: { companyName: { type: string }, ownerName: { type: string }, ownerEmail: { type: string }, ownerPhone: { type: string }, state: { type: string }, timezone: { type: string }, tier: { type: string, enum: [free, pro, business] }, billing: { type: string, enum: [yearly, monthly] }, founding: { type: boolean }, note: { type: string } } } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/AdminCompany' } } } } }
+  /admin/companies/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AdminCompany' } } } } }
+    patch:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Change plan/seats/status (suspend), with reason — logged in platformAudit and in the company's history
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { tier: { type: string }, extraSeats: { type: integer }, status: { type: string, enum: [active, suspended, closed] }, founding: { type: boolean }, reason: { type: string } } } } } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AdminCompany' } } } } }
+  /admin/support-access:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SupportAccess' } } } } } }
+    post:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Request access to a company's data — the owner gets a notice and must approve
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [companyId, reason, scope], properties: { companyId: { $ref: '#/components/schemas/Id' }, reason: { type: string }, scope: { type: string, enum: [read, readWrite] } } } } } }
+      responses: { '201': { description: Requested, content: { application/json: { schema: { $ref: '#/components/schemas/SupportAccess' } } } } }
+  /admin/support-access/{id}/session:
+    post:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Open an approved support session — returns a tenant token marked with supportSessionId (every action is logged in the company's history)
+      parameters: [ { $ref: '#/components/parameters/id' } ]
+      responses: { '200': { $ref: '#/components/responses/Tokens' }, '403': { description: Not approved or expired } }
+  /admin/ad-networks:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdNetwork' } } } } } } }
+    post: { tags: [Superadmin], security: [ { staffBearer: [] } ], requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdNetwork' } } } }, responses: { '201': { description: Created } } }
+  /admin/ad-networks/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    patch: { tags: [Superadmin], security: [ { staffBearer: [] } ], requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdNetwork' } } } }, responses: { '200': { description: OK } } }
+    delete: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '204': { description: Removed } } }
+  /admin/ad-placements:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdPlacement' } } } } } } }
+    put: { tags: [Superadmin], security: [ { staffBearer: [] } ], summary: Replace placements (crew app + web portal banners and rules), requestBody: { required: true, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdPlacement' } } } } }, responses: { '200': { description: OK } } }
+  /admin/ads/revenue:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Impressions, fill rate, eCPM and revenue by network, placement, surface and day
+      parameters: [ { $ref: '#/components/parameters/from' }, { $ref: '#/components/parameters/to' }, { name: groupBy, in: query, schema: { type: string, enum: [network, placement, surface, day, company] } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true } } } } } }
+  /admin/costs:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], summary: 'Cost lines (hosting, storage, SMS, maps, translation, PDF)', responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CostLine' } } } } } } }
+    post: { tags: [Superadmin], security: [ { staffBearer: [] } ], summary: Add a cost line, requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CostLine' } } } }, responses: { '201': { description: Created } } }
+  /admin/costs/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    patch: { tags: [Superadmin], security: [ { staffBearer: [] } ], requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CostLine' } } } }, responses: { '200': { description: OK } } }
+    delete: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '204': { description: Removed } } }
+  /admin/usage:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Metered usage per day (punches, photos, storage, SMS, translations, PDFs) and cost per company
+      parameters: [ { $ref: '#/components/parameters/from' }, { $ref: '#/components/parameters/to' }, { name: companyId, in: query, schema: { $ref: '#/components/schemas/Id' } } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true } } } } } }
+  /admin/plans:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Plan' } } } } } } }
+    post:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Publish a new price version (effectiveFrom). Existing customers keep their price until renewal.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Plan' } } } }
+      responses: { '201': { description: Created } }
+  /admin/promotions:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Promotion' } } } } } } }
+    post: { tags: [Superadmin], security: [ { staffBearer: [] } ], requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Promotion' } } } }, responses: { '201': { description: Created } } }
+  /admin/legal-holds:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/LegalHold' } } } } } } }
+    post: { tags: [Superadmin], security: [ { staffBearer: [] } ], summary: Place a hold — the retention job skips this company (or person), requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LegalHold' } } } }, responses: { '201': { description: Created } } }
+  /admin/legal-holds/{id}/release:
+    post: { tags: [Superadmin], security: [ { staffBearer: [] } ], parameters: [ { $ref: '#/components/parameters/id' } ], requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string } } } } } }, responses: { '204': { description: Released } } }
+  /admin/retention/preview:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: What tonight's purge will delete, per company (dry run)
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { companyId: { $ref: '#/components/schemas/Id' }, before: { type: string, format: date }, punches: { type: integer }, photos: { type: integer }, briefings: { type: integer }, held: { type: boolean } } } } } } } }
+  /admin/staff:
+    get: { tags: [Superadmin], security: [ { staffBearer: [] } ], responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Staff' } } } } } } }
+    post: { tags: [Superadmin], security: [ { staffBearer: [] } ], requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Staff' } } } }, responses: { '201': { description: Created } } }
+  /admin/staff/{id}:
+    parameters: [ { $ref: '#/components/parameters/id' } ]
+    patch: { tags: [Superadmin], security: [ { staffBearer: [] } ], requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Staff' } } } }, responses: { '200': { description: OK } } }
+  /admin/audit:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Everything staff did (append-only)
+      parameters: [ { name: staffId, in: query, schema: { $ref: '#/components/schemas/Id' } }, { name: companyId, in: query, schema: { $ref: '#/components/schemas/Id' } }, { $ref: '#/components/parameters/from' }, { $ref: '#/components/parameters/to' }, { $ref: '#/components/parameters/cursor' } ]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/PlatformAudit' } }, nextCursor: { type: [string, 'null'] } } } } } } }
+  /admin/platform:
+    get:
+      tags: [Superadmin]
+      security: [ { staffBearer: [] } ]
+      summary: Platform health — API errors, job queue, last retention run, SMS/maps/translation provider status, app versions in use
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT, description: 'Access token (15 min). Claims: aid (accountId), uid (membership userId), cid (companyId), role, sid (session), ss (supportSessionId, optional). Before a company is picked, cid/uid are absent and only /me/companies and /auth/select-company work.' }
+    staffBearer: { type: http, scheme: bearer, bearerFormat: JWT, description: Staff token from /admin/auth/login. Different signing key and audience from tenant tokens. }
+  parameters:
+    id: { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    cursor: { name: cursor, in: query, schema: { type: string } }
+    from: { name: from, in: query, schema: { type: string, format: date } }
+    to: { name: to, in: query, schema: { type: string, format: date } }
+  responses:
+    Tokens:
+      description: Signed in
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              accessToken: { type: string }
+              refreshToken: { type: string }
+              expiresIn: { type: integer, example: 900 }
+              user: { $ref: '#/components/schemas/User' }
+              needsCompany: { type: boolean, description: 'true when the login belongs to more than one company and none is picked yet. The access token can then only call /me/companies and /auth/select-company.' }
+              companies: { type: array, items: { $ref: '#/components/schemas/Membership' } }
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Job:
+      description: Accepted — poll /jobs/{id}
+      content: { application/json: { schema: { $ref: '#/components/schemas/Job' } } }
+  schemas:
+    Id: { type: string, pattern: '^[a-f0-9]{24}$', description: MongoDB ObjectId as hex }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, example: OUTSIDE_SITE }
+        message: { type: string, description: In the caller's language }
+        details: { type: object, additionalProperties: true }
+    I18n:
+      type: object
+      required: [en, es]
+      properties: { en: { type: string }, es: { type: string }, src: { type: string, enum: [en, es], description: Language it was typed in; the other was auto-translated } }
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties: { lat: { type: number, minimum: -90, maximum: 90 }, lng: { type: number, minimum: -180, maximum: 180 }, accuracyFt: { type: integer } }
+    Device:
+      type: object
+      properties: { type: { type: string, enum: [phone, tablet, kiosk, web] }, os: { type: string }, model: { type: string }, appVersion: { type: string }, deviceId: { type: string } }
+    Role: { type: string, enum: [owner, admin, supervisor, employee] }
+    Membership:
+      type: object
+      description: One company this login belongs to
+      properties:
+        companyId: { $ref: '#/components/schemas/Id' }
+        companyName: { type: string }
+        city: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        status: { type: string, enum: [invited, active] }
+        plan: { type: string, enum: [free, pro, business] }
+        portalAllowed: { type: boolean, description: false for employee-only memberships }
+        lastActiveAt: { type: [string, 'null'], format: date-time }
+        clockState: { type: string, enum: [out, in, onBreak] }
+    Messaging:
+      type: object
+      properties:
+        mode: { type: string, enum: [tmclock, own] }
+        provider: { type: [string, 'null'], enum: [twilio, telnyx, vonage, plivo, bandwidth, other, null] }
+        accountId: { type: [string, 'null'], description: 'Account SID / key ID — not secret' }
+        tokenSet: { type: boolean }
+        tokenLast4: { type: [string, 'null'] }
+        tokenSetAt: { type: [string, 'null'], format: date-time }
+        fromNumber: { type: [string, 'null'] }
+        senderId: { type: [string, 'null'] }
+        webhookUrl: { type: string }
+        status: { type: string, enum: [none, saved, verified, failed] }
+        testedAt: { type: [string, 'null'], format: date-time }
+        lastError: { type: [string, 'null'] }
+    MessagingInput:
+      type: object
+      required: [mode]
+      properties:
+        mode: { type: string, enum: [tmclock, own] }
+        provider: { type: string, enum: [twilio, telnyx, vonage, plivo, bandwidth, other] }
+        accountId: { type: string, maxLength: 120 }
+        token: { type: string, writeOnly: true, minLength: 16, maxLength: 500, description: The token from the provider. Write-only. }
+        fromNumber: { type: string, pattern: '^\+[1-9]\d{7,14}$' }
+        senderId: { type: string, maxLength: 120 }
+    Module: { type: string, enum: [punch, appr, tc, brief, task, emp, sch, site, set, plan] }
+    PermissionKey:
+      type: string
+      enum: [company.settings, users.manage, sites.manage, payroll.export, pay.view, punch.approve, briefing.give, punch.crew, punch.edit, location.override, timecards.approve, payperiod.editLocked, punch.self]
+    UserRef: { type: object, properties: { id: { $ref: '#/components/schemas/Id' }, name: { type: string }, initials: { type: string } } }
+    SiteRef: { type: object, properties: { id: { $ref: '#/components/schemas/Id' }, name: { type: string }, colorIndex: { type: integer } } }
+    CompanySummary:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        timezone: { type: string }
+        plan: { type: object, properties: { tier: { type: string, enum: [free, pro, business] }, retentionDays: { type: integer }, seats: { type: integer }, seatsUsed: { type: integer }, adsEnabled: { type: boolean } } }
+    CompanyProfilePatch:
+      type: object
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        email: { type: string }
+        address: { type: object, properties: { line1: { type: string }, line2: { type: string }, city: { type: string }, state: { type: string }, zip: { type: string } } }
+        state: { type: string, minLength: 2, maxLength: 2 }
+        timezone: { type: string }
+        weekStart: { type: string, enum: [sun, mon] }
+        language: { type: string, enum: [en, es] }
+    CompanySettings:
+      type: object
+      properties:
+        payPeriod: { type: object, properties: { type: { type: string, enum: [weekly, biweekly, semimonthly] }, anchorDate: { type: string, format: date } } }
+        overtime:
+          type: object
+          properties:
+            ruleKey: { type: [string, 'null'], enum: [null, federal, CA, AK, NV, CO, MN, PR, custom] }
+            perSite: { type: boolean }
+            nvLowWage: { type: boolean }
+            prAltWeek: { type: boolean }
+            custom: { type: object, properties: { weeklyHours: { type: integer }, dailyHours: { type: [integer, 'null'] }, doubleAfter: { type: [integer, 'null'] }, seventhDay: { type: boolean } } }
+        rounding: { type: integer, enum: [0, 5, 6, 10, 15] }
+        location:
+          type: object
+          properties:
+            required: { type: boolean }
+            photoRequired: { type: boolean }
+            radiusFt: { type: integer, minimum: 50, maximum: 10000, default: 500 }
+            unit: { type: string, enum: [ft, m] }
+            outsideRule: { type: string, enum: [block, flag, allow], default: flag }
+            supervisorOverride: { type: boolean }
+            dayOverride: { type: boolean }
+            employeeAnywhere: { type: boolean }
+            minAccuracyFt: { type: integer, default: 200 }
+        breaks: { type: object, properties: { lengthMin: { type: integer, default: 30 }, paid: { type: boolean, default: false }, remind: { type: boolean, default: true }, flagLong: { type: boolean, default: true } } }
+        grace:
+          type: object
+          description: Minutes before/after the scheduled start and end. See docs/API.md §Grace.
+          properties:
+            earlyMin: { type: integer, default: 15, description: May clock in up to N min before the scheduled start }
+            lateMin: { type: integer, default: 5, description: Not marked late until N min after the start }
+            leaveEarlyMin: { type: integer, default: 5 }
+            stayLateMin: { type: integer, default: 10, description: Clock-outs within N min after the end are paid to the scheduled end }
+            earlyPay: { type: string, enum: [scheduled, actual], default: scheduled, description: Early clock-in inside the window is paid from the scheduled start or the actual punch }
+            blockOutsideGrace: { type: boolean, default: false, description: Block clock-in more than earlyMin before the start }
+        permissions:
+          type: array
+          items: { type: object, required: [key], properties: { key: { $ref: '#/components/schemas/PermissionKey' }, owner: { type: boolean }, admin: { type: boolean }, supervisor: { type: boolean }, employee: { type: boolean } } }
+    Company:
+      allOf:
+        - $ref: '#/components/schemas/CompanyProfilePatch'
+        - type: object
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            plan: { $ref: '#/components/schemas/CompanySummary/properties/plan' }
+            settings: { $ref: '#/components/schemas/CompanySettings' }
+            logoUrl: { type: [string, 'null'] }
+            createdAt: { type: string, format: date-time }
+    OvertimeRule:
+      type: object
+      properties:
+        key: { type: string }
+        name: { $ref: '#/components/schemas/I18n' }
+        weeklyHours: { type: integer }
+        dailyHours: { type: [integer, 'null'] }
+        doubleAfter: { type: [integer, 'null'] }
+        seventhDay: { type: [string, 'null'], enum: [null, ca, pr] }
+        note: { $ref: '#/components/schemas/I18n' }
+    User:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        accountId: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        initials: { type: string }
+        title: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        supervisorId: { type: [string, 'null'] }
+        phone: { type: string }
+        email: { type: [string, 'null'] }
+        language: { type: string, enum: [en, es] }
+        status: { type: string, enum: [invited, active, inactive] }
+        anywhere: { type: boolean }
+        anywhereReason: { type: [string, 'null'] }
+        payRateCents: { type: [integer, 'null'], description: Only present for callers with pay.view }
+        emergencyContact: { type: object, properties: { name: { type: string }, relationship: { type: string }, phone: { type: string } } }
+        photoOnFileUrl: { type: [string, 'null'] }
+        lastLoginAt: { type: [string, 'null'], format: date-time }
+    UserInput:
+      type: object
+      properties:
+        name: { type: string }
+        title: { type: string }
+        role: { type: string, enum: [admin, supervisor, employee] }
+        supervisorId: { type: [string, 'null'] }
+        phone: { type: string }
+        email: { type: [string, 'null'] }
+        language: { type: string, enum: [en, es] }
+        status: { type: string, enum: [active, inactive] }
+        anywhere: { type: boolean }
+        anywhereReason: { type: string }
+        payRateCents: { type: [integer, 'null'], minimum: 0 }
+        emergencyContact: { type: object, properties: { name: { type: string }, relationship: { type: string }, phone: { type: string } } }
+        defaultSiteId: { type: [string, 'null'] }
+    UserPage: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/User' } }, nextCursor: { type: [string, 'null'] }, seats: { type: object, properties: { used: { type: integer }, limit: { type: integer } } } } }
+    Site:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        address: { type: string }
+        state: { type: [string, 'null'] }
+        lat: { type: [number, 'null'] }
+        lng: { type: [number, 'null'] }
+        radiusFt: { type: integer }
+        useDefaultRadius: { type: boolean }
+        effectiveRadiusFt: { type: integer }
+        overtimeRuleKey: { type: string, description: Rule that applies at this site }
+        supervisorId: { type: [string, 'null'] }
+        active: { type: boolean }
+        colorIndex: { type: integer }
+        onSiteNow: { type: integer }
+    SiteInput:
+      type: object
+      properties: { name: { type: string }, address: { type: string }, lat: { type: number }, lng: { type: number }, placeId: { type: string }, radiusFt: { type: integer, minimum: 50, maximum: 10000 }, useDefaultRadius: { type: boolean }, supervisorId: { type: [string, 'null'] }, active: { type: boolean } }
+    Task:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        code: { type: string }
+        name: { $ref: '#/components/schemas/I18n' }
+        type: { type: string, enum: [work, safety, travel, shop] }
+        paid: { type: boolean }
+        siteIds: { type: array, items: { $ref: '#/components/schemas/Id' }, description: Empty = all job sites }
+        order: { type: integer }
+        active: { type: boolean }
+        minutesThisPeriod: { type: integer }
+    TaskInput:
+      type: object
+      properties: { code: { type: string, maxLength: 20 }, name: { type: object, properties: { en: { type: string }, es: { type: string } } }, type: { type: string, enum: [work, safety, travel, shop] }, paid: { type: boolean }, siteIds: { type: array, items: { $ref: '#/components/schemas/Id' } }, active: { type: boolean } }
+    SafetyItem:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, kind: { type: string, enum: [hazard, ppe] }, name: { $ref: '#/components/schemas/I18n' }, active: { type: boolean }, order: { type: integer } }
+    SafetyItemInput:
+      type: object
+      properties: { kind: { type: string, enum: [hazard, ppe] }, name: { type: object, properties: { en: { type: string }, es: { type: string } } }, active: { type: boolean } }
+    Shift:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        user: { $ref: '#/components/schemas/UserRef' }
+        site: { $ref: '#/components/schemas/SiteRef' }
+        taskId: { type: [string, 'null'] }
+        workDate: { type: string, format: date }
+        start: { type: string, example: '07:00' }
+        end: { type: string, example: '15:30' }
+        unpaidBreakMin: { type: integer, example: 30 }
+        minutes: { type: integer, description: Paid minutes (end - start - unpaid break) }
+        published: { type: boolean }
+        note: { type: [string, 'null'] }
+    ShiftInput:
+      type: object
+      required: [userId, siteId, workDate, start, end]
+      properties: { userId: { $ref: '#/components/schemas/Id' }, siteId: { $ref: '#/components/schemas/Id' }, taskId: { type: [string, 'null'] }, workDate: { type: string, format: date }, start: { type: string, pattern: '^\d{2}:\d{2}$' }, end: { type: string, pattern: '^\d{2}:\d{2}$' }, unpaidBreakMin: { type: integer }, note: { type: string } }
+    PunchKind: { type: string, enum: [in, breakStart, breakEnd, out] }
+    PunchFlag: { type: string, enum: [outside, late, early, missingOut, longBreak, edited, manual, lowAccuracy] }
+    EditReason: { type: string, enum: [forgot, wrongTime, wrongSite, phone, supervisorEntry, other] }
+    PunchCreate:
+      type: object
+      required: [clientId, kind, deviceAt, device]
+      properties:
+        clientId: { type: string, format: uuid, description: Made on the phone; retries reuse it }
+        userId: { $ref: '#/components/schemas/Id', description: 'Only when a supervisor clocks someone else in (needs punch.crew)' }
+        kind: { $ref: '#/components/schemas/PunchKind' }
+        deviceAt: { type: string, format: date-time, description: Phone time of the tap }
+        at: { type: string, format: date-time, description: 'Clock-out on free plan = when the ad ended. Omit otherwise (server uses deviceAt for offline, receivedAt for online).' }
+        offline: { type: boolean }
+        gps: { $ref: '#/components/schemas/GeoPoint' }
+        siteId: { $ref: '#/components/schemas/Id' }
+        taskId: { $ref: '#/components/schemas/Id' }
+        shiftId: { $ref: '#/components/schemas/Id' }
+        photoFileId: { $ref: '#/components/schemas/Id' }
+        override: { type: object, properties: { type: { type: string, enum: [supervisorCode, day] }, code: { type: string }, reason: { type: string } } }
+        adEventId: { $ref: '#/components/schemas/Id' }
+        device: { $ref: '#/components/schemas/Device' }
+    Punch:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        user: { $ref: '#/components/schemas/UserRef' }
+        kind: { $ref: '#/components/schemas/PunchKind' }
+        at: { type: string, format: date-time }
+        workDate: { type: string, format: date }
+        site: { $ref: '#/components/schemas/SiteRef' }
+        task: { type: [object, 'null'], properties: { id: { type: string }, code: { type: string }, name: { $ref: '#/components/schemas/I18n' } } }
+        gps: { type: object, properties: { lat: { type: number }, lng: { type: number }, accuracyFt: { type: integer }, distanceFt: { type: integer }, inside: { type: boolean } } }
+        source: { type: string, enum: [app, kiosk, supervisor, portal] }
+        by: { $ref: '#/components/schemas/UserRef' }
+        review: { type: object, properties: { status: { type: string, enum: [pending, approved, rejected, retake] }, by: { $ref: '#/components/schemas/UserRef' }, at: { type: [string, 'null'], format: date-time }, note: { type: [string, 'null'] } } }
+        flags: { type: array, items: { $ref: '#/components/schemas/PunchFlag' } }
+        edited: { type: [object, 'null'], properties: { from: { type: string, format: date-time }, reason: { $ref: '#/components/schemas/EditReason' }, note: { type: string }, by: { $ref: '#/components/schemas/UserRef' }, at: { type: string, format: date-time } } }
+        device: { $ref: '#/components/schemas/Device' }
+    PunchDetail:
+      allOf:
+        - $ref: '#/components/schemas/Punch'
+        - type: object
+          properties:
+            photoUrl: { type: [string, 'null'] }
+            photoOnFileUrl: { type: [string, 'null'] }
+            history: { type: array, items: { $ref: '#/components/schemas/HistoryEntry' } }
+    PunchEdit:
+      type: object
+      required: [reason]
+      properties:
+        kind: { $ref: '#/components/schemas/PunchKind' }
+        at: { type: string, format: date-time }
+        siteId: { $ref: '#/components/schemas/Id' }
+        taskId: { $ref: '#/components/schemas/Id' }
+        reason: { $ref: '#/components/schemas/EditReason' }
+        note: { type: string, maxLength: 500 }
+        approve: { type: boolean, description: '"Save & approve" in the portal' }
+    PayPeriod:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        type: { type: string, enum: [weekly, biweekly, semimonthly] }
+        start: { type: string, format: date }
+        end: { type: string, format: date }
+        label: { type: string, example: 'Nov 16 – 22, 2026' }
+        current: { type: boolean }
+        status: { type: string, enum: [open, approved, locked] }
+        dataState: { type: string, enum: [kept, partlyDeleted, deleted], description: From the plan's retention days }
+        approvedBy: { $ref: '#/components/schemas/UserRef' }
+        approvedAt: { type: [string, 'null'], format: date-time }
+    Timecard:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        user: { $ref: '#/components/schemas/UserRef' }
+        payPeriodId: { $ref: '#/components/schemas/Id' }
+        days: { type: array, items: { type: object, properties: { date: { type: string, format: date }, minutes: { type: integer }, breakMin: { type: integer }, site: { $ref: '#/components/schemas/SiteRef' }, firstIn: { type: [string, 'null'], format: date-time }, lastOut: { type: [string, 'null'], format: date-time }, state: { type: string, enum: [ok, needsReview, needsFix, off, future] }, flags: { type: array, items: { type: string } } } } }
+        totals: { type: object, properties: { regularMin: { type: integer }, otMin: { type: integer }, dtMin: { type: integer }, totalMin: { type: integer } } }
+        status: { type: string, enum: [ok, needsReview, needsFix, approved] }
+        earnings: { $ref: '#/components/schemas/Earnings' }
+        employeeSignedAt: { type: [string, 'null'], format: date-time }
+        supervisorSignedAt: { type: [string, 'null'], format: date-time }
+    Earnings:
+      type: [object, 'null']
+      description: Null unless the caller has pay.view
+      properties: { rateCents: { type: integer }, regularCents: { type: integer }, otCents: { type: integer }, dtCents: { type: integer }, grossCents: { type: integer } }
+    ManualTimecardInput:
+      type: object
+      required: [userId, date, siteId, in, out, reason]
+      properties:
+        userId: { $ref: '#/components/schemas/Id' }
+        date: { type: string, format: date }
+        siteId: { $ref: '#/components/schemas/Id' }
+        taskId: { $ref: '#/components/schemas/Id' }
+        in: { type: string, pattern: '^\d{2}:\d{2}$' }
+        out: { type: string, pattern: '^\d{2}:\d{2}$' }
+        breakMin: { type: integer, default: 30 }
+        reason: { type: string, enum: [forgot, phone, noSignal, newHire, paperTimesheet, other] }
+        note: { type: string }
+        replace: { type: boolean, default: false }
+    Signature:
+      type: object
+      properties: { url: { type: string }, signedAt: { type: string, format: date-time } }
+    Briefing:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        site: { $ref: '#/components/schemas/SiteRef' }
+        workDate: { type: string, format: date }
+        at: { type: string, format: date-time }
+        givenBy: { allOf: [ { $ref: '#/components/schemas/UserRef' }, { type: object, properties: { title: { type: string }, signature: { $ref: '#/components/schemas/Signature' } } } ] }
+        task: { type: [object, 'null'], properties: { code: { type: string }, name: { $ref: '#/components/schemas/I18n' } } }
+        hazards: { type: array, items: { $ref: '#/components/schemas/I18n' } }
+        ppe: { type: array, items: { $ref: '#/components/schemas/I18n' } }
+        note: { type: [object, 'null'], allOf: [ { $ref: '#/components/schemas/I18n' } ] }
+        gps: { type: object, properties: { lat: { type: number }, lng: { type: number } } }
+        attendees:
+          type: array
+          items:
+            type: object
+            properties:
+              user: { $ref: '#/components/schemas/UserRef' }
+              title: { type: string }
+              status: { type: string, enum: [signed, missing, excused] }
+              signedAt: { type: [string, 'null'], format: date-time }
+              signatureUrl: { type: [string, 'null'] }
+              shownIn: { type: string, enum: [en, es] }
+              device: { type: string, enum: [supervisorPhone, ownPhone, kiosk] }
+              resigns: { type: array, items: { type: object, properties: { at: { type: string, format: date-time }, approvedBy: { $ref: '#/components/schemas/UserRef' }, reason: { type: string } } } }
+        signed: { type: integer }
+        total: { type: integer }
+        status: { type: string, enum: [open, closed] }
+        pdfUrl: { type: [string, 'null'] }
+    BriefingForUser:
+      type: object
+      properties: { briefingId: { $ref: '#/components/schemas/Id' }, workDate: { type: string, format: date }, site: { $ref: '#/components/schemas/SiteRef' }, givenBy: { $ref: '#/components/schemas/UserRef' }, gave: { type: boolean }, taskCode: { type: [string, 'null'] }, hazards: { type: array, items: { $ref: '#/components/schemas/I18n' } }, ppe: { type: array, items: { $ref: '#/components/schemas/I18n' } }, status: { type: string, enum: [signed, missing, excused] }, signedAt: { type: [string, 'null'], format: date-time }, signatureUrl: { type: [string, 'null'] } }
+    BriefingCreate:
+      type: object
+      required: [siteId, hazardIds, ppeIds]
+      properties:
+        siteId: { $ref: '#/components/schemas/Id' }
+        taskId: { $ref: '#/components/schemas/Id' }
+        hazardIds: { type: array, items: { $ref: '#/components/schemas/Id' } }
+        ppeIds: { type: array, items: { $ref: '#/components/schemas/Id' } }
+        note: { type: string, maxLength: 1000, description: Typed in the supervisor's language; auto-translated }
+        attendeeIds: { type: array, items: { $ref: '#/components/schemas/Id' }, description: Defaults to everyone clocked in at the site }
+        gps: { $ref: '#/components/schemas/GeoPoint' }
+        clientId: { type: string, format: uuid }
+    Report:
+      type: object
+      properties:
+        key: { type: string }
+        title: { $ref: '#/components/schemas/I18n' }
+        period: { $ref: '#/components/schemas/PayPeriod' }
+        columns: { type: array, items: { type: object, properties: { key: { type: string }, label: { type: string }, numeric: { type: boolean } } } }
+        rows: { type: array, items: { type: object, additionalProperties: true } }
+        totals: { type: object, additionalProperties: true }
+        chart: { type: [array, 'null'], items: { type: object, properties: { label: { type: string }, value: { type: number } } } }
+    HistoryEntry:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        module: { $ref: '#/components/schemas/Module' }
+        action: { type: string, example: punch.edit }
+        what: { type: string, description: In the caller's language }
+        target: { type: object, properties: { type: { type: string }, id: { type: [string, 'null'] }, label: { type: string } } }
+        changes: { type: array, items: { type: object, properties: { field: { type: string }, label: { type: string }, before: {}, after: {} } } }
+        reason: { type: [string, 'null'] }
+        by: { type: object, properties: { userId: { type: [string, 'null'] }, name: { type: string }, role: { type: string } } }
+        source: { type: string, enum: [portal, app, kiosk, superadmin, system] }
+        device: { type: [string, 'null'] }
+        supportSession: { type: boolean }
+        at: { type: string, format: date-time }
+    Job:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, type: { type: string }, status: { type: string, enum: [queued, running, done, failed] }, fileUrl: { type: [string, 'null'] }, fileName: { type: [string, 'null'] }, error: { type: [string, 'null'] } }
+    Plan:
+      type: object
+      properties:
+        key: { type: string, enum: [free, pro, business] }
+        name: { $ref: '#/components/schemas/I18n' }
+        maxUsers: { type: [integer, 'null'], example: 50 }
+        includedSeats: { type: integer }
+        yearlyCents: { type: integer, example: 49900 }
+        monthlyCents: { type: integer, example: 4900 }
+        extraSeatYearlyCents: { type: integer, example: 500 }
+        extraSeatMin: { type: integer, example: 10 }
+        retentionDays: { type: integer, example: 365 }
+        ads: { type: boolean }
+        effectiveFrom: { type: string, format: date-time }
+    Promotion:
+      type: object
+      properties: { key: { type: string, example: founding }, name: { type: string }, tier: { type: string }, yearlyCents: { type: integer, example: 29900 }, lockMonths: { type: integer, example: 24 }, maxCompanies: { type: [integer, 'null'], example: 100 }, used: { type: integer }, active: { type: boolean } }
+    Quote:
+      type: object
+      properties:
+        tier: { type: string }
+        billing: { type: string }
+        employees: { type: integer }
+        includedSeats: { type: integer }
+        extraSeats: { type: integer, description: Rounded up to blocks of 10 }
+        baseCents: { type: integer }
+        extraCents: { type: integer }
+        totalYearlyCents: { type: integer }
+        perEmployeeMonthlyCents: { type: integer }
+        suggestion: { type: [string, 'null'], description: e.g. "Business is cheaper above 125 employees" }
+    Billing:
+      type: object
+      properties: { plan: { $ref: '#/components/schemas/Plan' }, billing: { type: string }, seats: { type: integer }, seatsUsed: { type: integer }, extraSeats: { type: integer }, founding: { type: boolean }, foundingLockedUntil: { type: [string, 'null'], format: date }, status: { type: string }, renewsAt: { type: [string, 'null'], format: date }, invoices: { type: array, items: { type: object, properties: { number: { type: string }, date: { type: string, format: date }, totalCents: { type: integer }, status: { type: string }, url: { type: string } } } } }
+    AdConfig:
+      type: object
+      properties:
+        enabled: { type: boolean, description: false on Pro/Business }
+        networks: { type: array, items: { type: object, properties: { key: { type: string }, appId: { type: string }, priority: { type: integer } } } }
+        placements: { type: array, items: { $ref: '#/components/schemas/AdPlacement' } }
+        autoCloseSec: { type: integer, example: 5, description: Close the ad this many seconds after it finishes if the person doesn't }
+        bannerText: { $ref: '#/components/schemas/I18n', description: '"Remove ads: Pro $499/yr · Business $999/yr" — built from the plan catalog' }
+        punchMessage: { $ref: '#/components/schemas/I18n', description: '"Your punch will be saved at the end of the ad"' }
+    AdEventInput:
+      type: object
+      properties:
+        surface: { type: string, enum: [crewApp, portal] }
+        placement: { type: string }
+        network: { type: string }
+        format: { type: string, enum: [interstitial, rewarded, banner, native] }
+        platform: { type: string, enum: [ios, android, web] }
+        startedAt: { type: string, format: date-time }
+        endedAt: { type: string, format: date-time }
+        closedAt: { type: string, format: date-time }
+        closedBy: { type: string, enum: [user, auto, background, failed, noFill] }
+        revenueMicros: { type: integer }
+        currency: { type: string }
+    AdNetwork:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, key: { type: string, example: pangle }, name: { type: string, example: 'Pangle (TikTok)' }, surface: { type: string, enum: [crewApp, portal, both] }, enabled: { type: boolean }, priority: { type: integer }, formats: { type: array, items: { type: string } }, appIds: { type: object, properties: { ios: { type: string }, android: { type: string }, web: { type: string } } }, floorCpmCents: { type: [integer, 'null'] }, notes: { type: string } }
+    AdPlacement:
+      type: object
+      properties: { key: { type: string, example: clockOut }, surface: { type: string, enum: [crewApp, portal] }, format: { type: string, enum: [interstitial, rewarded, banner, native] }, enabled: { type: boolean }, sizes: { type: array, items: { type: string, example: 728x90 } }, pages: { type: array, items: { type: string } }, minGapSec: { type: integer }, autoCloseSec: { type: integer } }
+    CostLine:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, name: { type: string }, category: { type: string }, unit: { type: string }, unitCostMicros: { type: integer }, quantity: { type: number }, source: { type: string, enum: [manual, metered] }, active: { type: boolean }, order: { type: integer } }
+    SupportAccess:
+      type: [object, 'null']
+      properties: { id: { $ref: '#/components/schemas/Id' }, companyId: { $ref: '#/components/schemas/Id' }, staffName: { type: string }, reason: { type: string }, scope: { type: string, enum: [read, readWrite] }, status: { type: string, enum: [requested, approved, denied, expired, revoked] }, requestedAt: { type: string, format: date-time }, expiresAt: { type: [string, 'null'], format: date-time } }
+    LegalHold:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, companyId: { $ref: '#/components/schemas/Id' }, userId: { type: [string, 'null'] }, reason: { type: string }, placedAt: { type: string, format: date-time }, releasedAt: { type: [string, 'null'], format: date-time } }
+    Staff:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, name: { type: string }, email: { type: string }, role: { type: string, enum: [superadmin, support, sales, finance, readonly] }, status: { type: string, enum: [active, inactive] }, mfaEnabled: { type: boolean } }
+    AdminCompany:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, name: { type: string }, state: { type: string }, owner: { type: object, properties: { name: { type: string }, email: { type: string }, phone: { type: string } } }, plan: { $ref: '#/components/schemas/CompanySummary/properties/plan' }, founding: { type: boolean }, status: { type: string }, users: { type: integer }, lastActivityAt: { type: [string, 'null'], format: date-time }, adRevenueMicros30d: { type: integer }, costMicros30d: { type: integer }, createdAt: { type: string, format: date-time } }
+    PlatformAudit:
+      type: object
+      properties: { id: { $ref: '#/components/schemas/Id' }, staffName: { type: string }, action: { type: string }, companyId: { type: [string, 'null'] }, target: { type: object, additionalProperties: true }, changes: { type: array, items: { type: object, additionalProperties: true } }, reason: { type: [string, 'null'] }, ip: { type: string }, at: { type: string, format: date-time } }
