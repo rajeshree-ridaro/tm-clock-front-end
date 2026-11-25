@@ -16,7 +16,8 @@ abstract interface class AuthRepository {
   Future<List<Membership>> myCompanies();
 
   /// `POST /auth/select-company`. `client` is `portal` or `app`.
-  Future<void> selectCompany(String companyId, {required String client});
+  /// `remember` makes the picker pre-select this company next time.
+  Future<void> selectCompany(String companyId, {required String client, bool remember = false});
 
   /// `POST /auth/logout`
   Future<void> logout();
@@ -54,10 +55,10 @@ class HttpAuthRepository implements AuthRepository {
   }
 
   @override
-  Future<void> selectCompany(String companyId, {required String client}) async {
+  Future<void> selectCompany(String companyId, {required String client, bool remember = false}) async {
     await _saveTokens(await _api.post(
       '/auth/select-company',
-      body: {'companyId': companyId, 'remember': true, 'client': client},
+      body: {'companyId': companyId, 'remember': remember, 'client': client},
     ));
   }
 

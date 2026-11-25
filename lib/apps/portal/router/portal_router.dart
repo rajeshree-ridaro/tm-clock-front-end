@@ -16,41 +16,84 @@ import 'package:tm_clock/apps/portal/features/timecards/presentation/timecards_p
 import 'package:tm_clock/apps/portal/router/portal_routes.dart';
 import 'package:tm_clock/core/app/app_scope.dart';
 
-/// No page transition — matches the prototype's instant view switching.
-Page<void> _page(GoRouterState state, Widget child) =>
-    NoTransitionPage(key: state.pageKey, child: child);
+GoRouter buildPortalRouter(AppServices services) {
+  /// No page transition — matches the prototype's instant view switching.
+  /// Keyed by company: switching company (menu switcher) gives the page fresh state, so it
+  /// reloads its data. It listens to the session itself because the router doesn't rebuild
+  /// a page whose address didn't change.
+  Page<void> page(GoRouterState state, Widget child) => NoTransitionPage(
+    key: state.pageKey,
+    child: ListenableBuilder(
+      listenable: services.session,
+      builder: (_, _) => KeyedSubtree(
+        key: ValueKey(services.session.company?.companyId),
+        child: child,
+      ),
+    ),
+  );
 
-GoRouter buildPortalRouter(AppServices services) => GoRouter(
-      initialLocation: Routes.signIn,
-      refreshListenable: services.session,
-      redirect: (context, state) {
-        final atSignIn = state.matchedLocation == Routes.signIn;
-        final ready = services.session.hasCompany;
-        if (!ready && !atSignIn) return Routes.signIn;
-        if (ready && atSignIn) return Routes.dashboard;
-        return null;
-      },
-      routes: [
-        GoRoute(path: '/', redirect: (_, _) => Routes.signIn),
-        GoRoute(
-          path: Routes.signIn,
-          pageBuilder: (_, s) => _page(s, const SignInPage()),
-        ),
-        ShellRoute(
-          builder: (context, state, child) =>
-              AppShell(location: state.uri.path, child: child),
-          routes: [
-            GoRoute(path: Routes.dashboard, pageBuilder: (_, s) => _page(s, const DashboardPage())),
-            GoRoute(path: Routes.approvals, pageBuilder: (_, s) => _page(s, const ApprovalsPage())),
-            GoRoute(path: Routes.timecards, pageBuilder: (_, s) => _page(s, const TimecardsPage())),
-            GoRoute(path: Routes.tasks, pageBuilder: (_, s) => _page(s, const TasksPage())),
-            GoRoute(path: Routes.employees, pageBuilder: (_, s) => _page(s, const EmployeesPage())),
-            GoRoute(path: Routes.schedules, pageBuilder: (_, s) => _page(s, const SchedulesPage())),
-            GoRoute(path: Routes.sites, pageBuilder: (_, s) => _page(s, const SitesPage())),
-            GoRoute(path: Routes.reports, pageBuilder: (_, s) => _page(s, const ReportsPage())),
-            GoRoute(path: Routes.history, pageBuilder: (_, s) => _page(s, const HistoryPage())),
-            GoRoute(path: Routes.settings, pageBuilder: (_, s) => _page(s, const SettingsPage())),
-          ],
-        ),
-      ],
-    );
+  return GoRouter(
+    initialLocation: Routes.signIn,
+    refreshListenable: services.session,
+    redirect: (context, state) {
+      final atSignIn = state.matchedLocation == Routes.signIn;
+      final ready = services.session.hasCompany;
+      if (!ready && !atSignIn) return Routes.signIn;
+      if (ready && atSignIn) return Routes.dashboard;
+      return null;
+    },
+    routes: [
+      GoRoute(path: '/', redirect: (_, _) => Routes.signIn),
+      GoRoute(
+        path: Routes.signIn,
+        pageBuilder: (_, s) => page(s, const SignInPage()),
+      ),
+      ShellRoute(
+        builder: (context, state, child) =>
+            AppShell(location: state.uri.path, child: child),
+        routes: [
+          GoRoute(
+            path: Routes.dashboard,
+            pageBuilder: (_, s) => page(s, const DashboardPage()),
+          ),
+          GoRoute(
+            path: Routes.approvals,
+            pageBuilder: (_, s) => page(s, const ApprovalsPage()),
+          ),
+          GoRoute(
+            path: Routes.timecards,
+            pageBuilder: (_, s) => page(s, const TimecardsPage()),
+          ),
+          GoRoute(
+            path: Routes.tasks,
+            pageBuilder: (_, s) => page(s, const TasksPage()),
+          ),
+          GoRoute(
+            path: Routes.employees,
+            pageBuilder: (_, s) => page(s, const EmployeesPage()),
+          ),
+          GoRoute(
+            path: Routes.schedules,
+            pageBuilder: (_, s) => page(s, const SchedulesPage()),
+          ),
+          GoRoute(
+            path: Routes.sites,
+            pageBuilder: (_, s) => page(s, const SitesPage()),
+          ),
+          GoRoute(
+            path: Routes.reports,
+            pageBuilder: (_, s) => page(s, const ReportsPage()),
+          ),
+          GoRoute(
+            path: Routes.history,
+            pageBuilder: (_, s) => page(s, const HistoryPage()),
+          ),
+          GoRoute(
+            path: Routes.settings,
+            pageBuilder: (_, s) => page(s, const SettingsPage()),
+          ),
+        ],
+      ),
+    ],
+  );
+}

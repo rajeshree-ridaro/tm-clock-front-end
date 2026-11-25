@@ -6,6 +6,8 @@ class EmployeesPage extends StatelessWidget {
   const EmployeesPage({super.key});
 
   @override
-  Widget build(BuildContext context) =>
-      const PlaceholderPage(titleKey: 'emp', icon: Icons.person_outline_rounded);
+  Widget build(BuildContext context) => const PlaceholderPage(
+    titleKey: 'emp',
+    icon: Icons.person_outline_rounded,
+  );
 }

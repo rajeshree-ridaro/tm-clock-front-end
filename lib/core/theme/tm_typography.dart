@@ -8,7 +8,8 @@ abstract final class TmType {
   static TextTheme textTheme(Color ink, Color mute, {bool large = false}) {
     final up = large ? 1.0 : 0.0;
     const body = TextTheme();
-    TextStyle plex(double size, {double height = 1.1}) => GoogleFonts.ibmPlexSans(
+    TextStyle plex(double size, {double height = 1.1}) =>
+        GoogleFonts.ibmPlexSans(
           fontSize: size,
           fontWeight: FontWeight.w600,
           height: height,
@@ -23,13 +24,25 @@ abstract final class TmType {
           headlineSmall: plex(20, height: 1.2),
           // h2: 18px
           titleLarge: plex(18 + up, height: 1.3),
-          titleMedium: GoogleFonts.inter(fontSize: 15 + up, fontWeight: FontWeight.w600),
-          titleSmall: GoogleFonts.inter(fontSize: 14, fontWeight: FontWeight.w600),
+          titleMedium: GoogleFonts.inter(
+            fontSize: 15 + up,
+            fontWeight: FontWeight.w600,
+          ),
+          titleSmall: GoogleFonts.inter(
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+          ),
           bodyLarge: GoogleFonts.inter(fontSize: 16, height: 1.5),
           bodyMedium: GoogleFonts.inter(fontSize: 15 + up, height: 1.45),
           bodySmall: GoogleFonts.inter(fontSize: 13, height: 1.4, color: mute),
-          labelLarge: GoogleFonts.inter(fontSize: 15 + up, fontWeight: FontWeight.w600),
-          labelMedium: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+          labelLarge: GoogleFonts.inter(
+            fontSize: 15 + up,
+            fontWeight: FontWeight.w600,
+          ),
+          labelMedium: GoogleFonts.inter(
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
           labelSmall: label(mute),
         )
         .apply(bodyColor: ink, displayColor: ink);
@@ -37,21 +50,25 @@ abstract final class TmType {
 
   /// `.lbl` — mono, 11px, uppercase, 0.6 letter spacing.
   static TextStyle label(Color color) => GoogleFonts.ibmPlexMono(
-        fontSize: 11,
-        fontWeight: FontWeight.w500,
-        letterSpacing: 0.6,
-        color: color,
-      );
+    fontSize: 11,
+    fontWeight: FontWeight.w500,
+    letterSpacing: 0.6,
+    color: color,
+  );
 
   /// `.stat .v` — big stat number.
   static TextStyle statValue(Color color) => GoogleFonts.ibmPlexSans(
-        fontSize: 32,
-        fontWeight: FontWeight.w600,
-        height: 1.1,
-        color: color,
-      );
+    fontSize: 32,
+    fontWeight: FontWeight.w600,
+    height: 1.1,
+    color: color,
+  );
 
   /// `.mono`
   static TextStyle mono(Color color, {double size = 14}) =>
-      GoogleFonts.ibmPlexMono(fontSize: size, fontWeight: FontWeight.w500, color: color);
+      GoogleFonts.ibmPlexMono(
+        fontSize: size,
+        fontWeight: FontWeight.w500,
+        color: color,
+      );
 }

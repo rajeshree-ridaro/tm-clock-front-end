@@ -29,8 +29,8 @@ class Session extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> selectCompany(Membership m, {required String client}) async {
-    await _auth.selectCompany(m.companyId, client: client);
+  Future<void> selectCompany(Membership m, {required String client, bool remember = false}) async {
+    await _auth.selectCompany(m.companyId, client: client, remember: remember);
     company = m;
     notifyListeners();
   }

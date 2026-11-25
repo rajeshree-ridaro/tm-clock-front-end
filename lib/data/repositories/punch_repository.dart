@@ -28,6 +28,30 @@ abstract interface class PunchRepository {
 
   /// Portal dashboard + supervisor crew list — `GET /dashboard`
   Future<Dashboard> dashboard();
+
+  /// Photo approvals queue — `GET /approvals` (pending first, then today's decided).
+  Future<ApprovalQueue> approvals();
+
+  /// Approve / reject / ask for a retake — `POST /punches/{id}/review`
+  Future<Punch> review(String punchId, ReviewStatus decision, {String? note});
+
+  /// Edit a punch (type, time, job site) with a reason — `PATCH /punches/{id}`.
+  /// [approve] is the portal's "Save & approve".
+  Future<Punch> editPunch(
+    String punchId, {
+    PunchKind? kind,
+    DateTime? at,
+    String? siteId,
+    required EditReason reason,
+    String? note,
+    bool approve = false,
+  });
+
+  /// "Approve all on site" — `POST /approvals/approve-on-site`. Returns how many were approved.
+  Future<int> approveOnSite({String? siteId});
+
+  /// Job sites — `GET /sites`
+  Future<List<SiteRef>> sites();
 }
 
 class HttpPunchRepository implements PunchRepository {
@@ -71,6 +95,44 @@ class HttpPunchRepository implements PunchRepository {
 
   @override
   Future<Dashboard> dashboard() async => Dashboard.fromJson(await _api.get('/dashboard'));
+
+  @override
+  Future<ApprovalQueue> approvals() async => ApprovalQueue.fromJson(await _api.get('/approvals'));
+
+  @override
+  Future<Punch> review(String punchId, ReviewStatus decision, {String? note}) async =>
+      Punch.fromJson(await _api.post('/punches/$punchId/review', body: {'decision': decision.name, 'note': ?note}));
+
+  @override
+  Future<Punch> editPunch(
+    String punchId, {
+    PunchKind? kind,
+    DateTime? at,
+    String? siteId,
+    required EditReason reason,
+    String? note,
+    bool approve = false,
+  }) async =>
+      Punch.fromJson(await _api.patch('/punches/$punchId', body: {
+        if (kind != null) 'kind': punchKindWire[kind],
+        if (at != null) 'at': at.toUtc().toIso8601String(),
+        'siteId': ?siteId,
+        'reason': reason.name,
+        if (note != null && note.isNotEmpty) 'note': note,
+        'approve': approve,
+      }));
+
+  @override
+  Future<int> approveOnSite({String? siteId}) async {
+    final json = await _api.post<Map<String, dynamic>>('/approvals/approve-on-site', body: {'siteId': ?siteId});
+    return json['approved'] as int? ?? 0;
+  }
+
+  @override
+  Future<List<SiteRef>> sites() async {
+    final json = await _api.get<Map<String, dynamic>>('/sites', query: {'active': true});
+    return [for (final s in json['items'] as List) SiteRef.fromJson(s as Map<String, dynamic>)];
+  }
 }
 
 /// RFC 4122 v4 UUID for `clientId`.

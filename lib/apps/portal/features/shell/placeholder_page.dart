@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'package:tm_clock/apps/portal/widgets/portal_header.dart';
 import 'package:tm_clock/core/l10n/strings.dart';
 import 'package:tm_clock/core/theme/tm_colors.dart';
 import 'package:tm_clock/core/widgets/tm_components.dart';
@@ -16,7 +17,7 @@ class PlaceholderPage extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        TmPageHeader(title: context.t(titleKey)),
+        PortalHeader(title: context.t(titleKey), showHistory: titleKey != 'hist'),
         const SizedBox(height: 22),
         TmCard(
           padding: const EdgeInsets.symmetric(vertical: 48, horizontal: 20),

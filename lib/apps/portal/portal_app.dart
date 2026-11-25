@@ -10,8 +10,8 @@ class PortalApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => const TmApp(
-        flavor: TmFlavor.portal,
-        title: 'TM Clock Portal',
-        buildRouter: buildPortalRouter,
-      );
+    flavor: TmFlavor.portal,
+    title: 'TM Clock Portal',
+    buildRouter: buildPortalRouter,
+  );
 }

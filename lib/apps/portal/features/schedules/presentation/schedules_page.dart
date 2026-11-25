@@ -6,6 +6,8 @@ class SchedulesPage extends StatelessWidget {
   const SchedulesPage({super.key});
 
   @override
-  Widget build(BuildContext context) =>
-      const PlaceholderPage(titleKey: 'sch', icon: Icons.calendar_month_outlined);
+  Widget build(BuildContext context) => const PlaceholderPage(
+    titleKey: 'sch',
+    icon: Icons.calendar_month_outlined,
+  );
 }

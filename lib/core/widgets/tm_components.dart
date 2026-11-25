@@ -97,9 +97,13 @@ class TmPill extends StatelessWidget {
             decoration: BoxDecoration(color: fg, shape: BoxShape.circle),
           ),
           const SizedBox(width: 6),
-          Text(
-            text,
-            style: TextStyle(color: fg, fontSize: 13, fontWeight: FontWeight.w600),
+          Flexible(
+            child: Text(
+              text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: fg, fontSize: 13, fontWeight: FontWeight.w600),
+            ),
           ),
         ],
       ),
